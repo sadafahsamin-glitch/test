@@ -1,0 +1,945 @@
+from OpenGL.GL import *
+from OpenGL.GLUT import *
+from OpenGL.GLU import *
+import random
+import math
+import time
+
+# ─────────────────────────────────────────────
+# CONSTANTS & GLOBALS
+# ─────────────────────────────────────────────
+W, H = 900, 650
+GRAVITY        = 0.45
+JUMP_VEL       = 13.0
+PLAYER_SPEED   = 170.0
+HOOK_SPEED     = 18.0
+HOOK_RANGE     = 550.0
+TILE_HP_MAX    = 3
+TILE_N         = 5        # tiles per side per rooftop
+BOSS_MAX_HP    = 5
+
+player = {
+    "pos":      [0.0, 0.0, 110.0],
+    "vel":      [0.0, 0.0,   0.0],
+    "on_ground": True,
+    "hp":       5,
+    "angle":    0.0,           # yaw degrees
+    "facing":   [1.0, 0.0, 0.0],
+    "iframes":  0,             # invincibility frames after hit
+}
+
+hook = {
+    "active":   False,
+    "pos":      [0.0, 0.0, 0.0],
+    "dir":      [0.0, 0.0, 0.0],
+    "attached": False,
+    "target":   None,
+}
+
+boss = {
+    "active":          False,
+    "pos":             [0.0, 0.0, 500.0],
+    "target_pos":      [0.0, 0.0, 500.0],
+    "hp":              BOSS_MAX_HP,
+    "propeller_angle": 0.0,
+    "state":           "idle",   # idle | locking | moving
+    "laser_active":    False,
+    "lock_timer":      0,
+    "move_timer":      90,
+}
+
+rooftops    = []   # list of dicts
+anchor_pts  = []   # mid-air grapple anchors
+projectiles = []
+enemies     = []
+tiles       = {}   # index → 2-D list of HP values
+
+wind       = [0.18, 0.06]
+keys_held  = set()
+game_state = "playing"   # playing | dead | win
+wave       = 1
+kills      = 0
+
+last_t = time.time()
+dt     = 0.016
+
+# ─────────────────────────────────────────────
+# WORLD SETUP
+# ─────────────────────────────────────────────
+def init_world():
+    global rooftops, anchor_pts, enemies
+
+    # 5×5 grid of buildings at varied heights
+    layout = [
+        # (cx,  cy,   cz,  size)
+        (-420,-420, 220, 155), (-210,-420, 120, 140), (0,  -420, 290, 160),
+        ( 210,-420, 180, 145), ( 420,-420, 150, 140),
+
+        (-420,-210, 110, 140), (-210,-210, 330, 160), (0,  -210, 170, 140),
+        ( 210,-210, 260, 155), ( 420,-210, 210, 145),
+
+        (-420,   0, 190, 155), (-210,   0, 160, 140), (0,     0,  90, 165),  # idx 12 = start
+        ( 210,   0, 240, 140), ( 420,   0, 310, 155),
+
+        (-420, 210, 270, 145), (-210, 210, 200, 155), (0,   210, 310, 145),
+        ( 210, 210, 130, 155), ( 420, 210, 200, 140),
+
+        (-420, 420, 150, 140), (-210, 420, 280, 155), (0,   420, 210, 145),
+        ( 210, 420, 160, 155), ( 420, 420, 250, 140),
+    ]
+
+    for i, (cx, cy, cz, sz) in enumerate(layout):
+        rooftops.append({"x": float(cx), "y": float(cy),
+                         "z": float(cz), "size": float(sz), "id": i})
+        tiles[i] = [[TILE_HP_MAX]*TILE_N for _ in range(TILE_N)]
+
+    # mid-air antenna anchors (puzzle nodes)
+    for ax, ay, az in [(-315,-420,350), (105,-420,370),
+                        (-315, 210,340), (315,   0,400), (0, 315,420)]:
+        anchor_pts.append({"x": float(ax), "y": float(ay), "z": float(az)})
+
+    # player starts on centre rooftop (idx 12)
+    s = rooftops[12]
+    player["pos"] = [s["x"], s["y"], s["z"] + 15.0]
+
+    spawn_enemies(wave)
+
+
+def spawn_enemies(n_wave):
+    global enemies
+    enemies = []
+    count = 3 + n_wave
+    for _ in range(count):
+        r = random.choice(rooftops)
+        enemies.append({
+            "pos":         [r["x"] + random.uniform(-30, 30),
+                            r["y"] + random.uniform(-30, 30),
+                            r["z"] + 14.0],
+            "hp":          2,
+            "shoot_timer": random.randint(70, 130),
+            "alive":       True,
+        })
+
+# ─────────────────────────────────────────────
+# DRAW HELPERS
+# ─────────────────────────────────────────────
+def solid_box(cx, cy, cz, sx, sy, sz):
+    glPushMatrix()
+    glTranslatef(cx, cy, cz)
+    glScalef(sx, sy, sz)
+    glutSolidCube(1.0)
+    glPopMatrix()
+
+def draw_rooftops_scene():
+    for ri, r in enumerate(rooftops):
+        half = r["size"] / 2.0
+        tw   = r["size"] / TILE_N
+
+        # ── building body ──────────────────────────
+        glColor3f(0.13, 0.13, 0.38)
+        solid_box(r["x"], r["y"], r["z"] / 2.0,
+                  r["size"], r["size"], r["z"])
+
+        # ── roof tiles ─────────────────────────────
+        for row in range(TILE_N):
+            for col in range(TILE_N):
+                hp = tiles[ri][row][col]
+                if hp <= 0:
+                    continue
+                frac = hp / TILE_HP_MAX
+                glColor3f(0.22 + 0.12*frac, 0.22 + 0.08*frac, 0.52 + 0.28*frac)
+
+                tx = r["x"] - half + col * tw + tw / 2
+                ty = r["y"] - half + row * tw + tw / 2
+                tz = r["z"] + 2.0
+
+                glBegin(GL_QUADS)
+                glNormal3f(0, 0, 1)
+                glVertex3f(tx - tw/2 + 1, ty - tw/2 + 1, tz)
+                glVertex3f(tx + tw/2 - 1, ty - tw/2 + 1, tz)
+                glVertex3f(tx + tw/2 - 1, ty + tw/2 - 1, tz)
+                glVertex3f(tx - tw/2 + 1, ty + tw/2 - 1, tz)
+                glEnd()
+
+                # tile edges (cracks between tiles)
+                glColor3f(0.08, 0.08, 0.22)
+                glBegin(GL_LINE_LOOP)
+                glVertex3f(tx - tw/2 + 1, ty - tw/2 + 1, tz + 0.5)
+                glVertex3f(tx + tw/2 - 1, ty - tw/2 + 1, tz + 0.5)
+                glVertex3f(tx + tw/2 - 1, ty + tw/2 - 1, tz + 0.5)
+                glVertex3f(tx - tw/2 + 1, ty + tw/2 - 1, tz + 0.5)
+                glEnd()
+
+
+def draw_anchors():
+    for a in anchor_pts:
+        # antenna mast
+        glColor3f(0.55, 0.55, 0.20)
+        solid_box(a["x"], a["y"], a["z"] - 10, 8, 8, 60)
+        # glowing tip
+        glColor3f(1.0, 0.8, 0.0)
+        glPushMatrix()
+        glTranslatef(a["x"], a["y"], a["z"] + 22)
+        glutSolidSphere(10, 8, 8)
+        glPopMatrix()
+
+
+def draw_player():
+    flash = (player["iframes"] // 3) % 2
+    if flash:
+        glColor3f(1.0, 1.0, 1.0)
+    else:
+        glColor3f(0.10, 0.92, 0.30)
+    solid_box(player["pos"][0], player["pos"][1], player["pos"][2], 16, 16, 22)
+
+
+def draw_enemies():
+    for e in enemies:
+        if not e["alive"]:
+            continue
+        glColor3f(0.90, 0.10, 0.10)
+        solid_box(e["pos"][0], e["pos"][1], e["pos"][2], 18, 18, 22)
+        # simple "eye"
+        glColor3f(1, 1, 0)
+        fx_e = player["pos"][0] - e["pos"][0]
+        fy_e = player["pos"][1] - e["pos"][1]
+        dm = math.sqrt(fx_e*fx_e + fy_e*fy_e + 1e-9)
+        glPushMatrix()
+        glTranslatef(e["pos"][0] + (fx_e/dm)*9,
+                     e["pos"][1] + (fy_e/dm)*9,
+                     e["pos"][2] + 6)
+        glutSolidSphere(3, 5, 5)
+        glPopMatrix()
+
+
+def draw_hook():
+    if not hook["active"]:
+        return
+    glColor3f(1.0, 0.92, 0.15)
+    glLineWidth(2.5)
+    glBegin(GL_LINES)
+    glVertex3f(*player["pos"])
+    glVertex3f(*hook["pos"])
+    glEnd()
+    glLineWidth(1.0)
+    glPushMatrix()
+    glTranslatef(*hook["pos"])
+    glutSolidSphere(5, 6, 6)
+    glPopMatrix()
+
+
+def draw_projectiles():
+    for p in projectiles:
+        if p.get("enemy"):
+            glColor3f(1.0, 0.35, 0.0)
+            s = 7
+        else:
+            glColor3f(0.75, 0.90, 1.0)
+            s = 5
+        solid_box(p["x"], p["y"], p["z"], s, s, s)
+
+
+def draw_boss():
+    if not boss["active"]:
+        return
+    bx, by, bz = boss["pos"]
+
+    # ── hull ──────────────────────────────────
+    glColor3f(0.25, 0.25, 0.25)
+    solid_box(bx, by, bz, 65, 65, 18)
+
+    # ── under-belly detail ─────────────────────
+    glColor3f(0.45, 0.10, 0.10)
+    solid_box(bx, by, bz - 8, 30, 30, 6)
+
+    # ── propellers (4 arms) ────────────────────
+    ang = boss["propeller_angle"]
+    for ox, oy in [(28, 28), (-28, 28), (28, -28), (-28, -28)]:
+        # arm
+        glColor3f(0.40, 0.40, 0.40)
+        solid_box(bx + ox/2, by + oy/2, bz + 10, abs(ox), 6, 5)
+        # spinning blades
+        glPushMatrix()
+        glTranslatef(bx + ox, by + oy, bz + 13)
+        glRotatef(ang, 0, 0, 1)
+        glColor3f(0.72, 0.72, 0.72)
+        solid_box(0, 0, 0, 34, 6, 3)
+        glRotatef(90, 0, 0, 1)
+        solid_box(0, 0, 0, 34, 6, 3)
+        glPopMatrix()
+
+    # ── laser lock-on beam ─────────────────────
+    if boss["laser_active"]:
+        pulse = 0.5 + 0.5 * math.sin(boss["lock_timer"] * 0.25)
+        glColor3f(1.0, pulse * 0.2, pulse * 0.2)
+        glLineWidth(3.0 + pulse * 2)
+        glBegin(GL_LINES)
+        glVertex3f(bx, by, bz - 9)
+        glVertex3f(*player["pos"])
+        glEnd()
+        glLineWidth(1.0)
+
+    # ── boss HP pips ───────────────────────────
+    for i in range(BOSS_MAX_HP):
+        if i < boss["hp"]:
+            glColor3f(0.9, 0.1, 0.9)
+        else:
+            glColor3f(0.2, 0.2, 0.2)
+        glPushMatrix()
+        glTranslatef(bx - 32 + i * 16, by + 40, bz + 18)
+        glutSolidSphere(5, 6, 6)
+        glPopMatrix()
+
+
+def draw_hud():
+    glDisable(GL_LIGHTING)
+    glDisable(GL_DEPTH_TEST)
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    gluOrtho2D(0, W, 0, H)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+
+    # ── HP hearts ─────────────────────────────
+    for i in range(5):
+        if i < player["hp"]:
+            glColor3f(0.95, 0.15, 0.15)
+        else:
+            glColor3f(0.30, 0.10, 0.10)
+        glBegin(GL_QUADS)
+        x0 = 12 + i * 26
+        glVertex2f(x0,    H - 32)
+        glVertex2f(x0+20, H - 32)
+        glVertex2f(x0+20, H - 12)
+        glVertex2f(x0,    H - 12)
+        glEnd()
+
+    # ── Wind compass ──────────────────────────
+    cx, cy = 65, 65
+    glColor3f(0.5, 0.5, 0.5)
+    glBegin(GL_LINE_LOOP)
+    for i in range(32):
+        a = 2*math.pi*i/32
+        glVertex2f(cx + 24*math.cos(a), cy + 24*math.sin(a))
+    glEnd()
+    # "WIND" label
+    draw_bmp_str(cx - 14, cy + 30, "WIND", (0.7,0.7,0.7))
+    # arrow
+    wx, wy = wind[0], wind[1]
+    wm = math.sqrt(wx*wx + wy*wy + 1e-9)
+    glColor3f(0.20, 0.80, 1.0)
+    glLineWidth(2.5)
+    arx, ary = wx/wm * 20, wy/wm * 20
+    glBegin(GL_LINES)
+    glVertex2f(cx, cy)
+    glVertex2f(cx + arx, cy + ary)
+    glEnd()
+    glLineWidth(1.0)
+
+    # ── Wave / kills ──────────────────────────
+    draw_bmp_str(12, H - 55, f"Wave {wave}   Kills {kills}", (0.85,0.85,0.85))
+
+    # ── Boss HP bar ───────────────────────────
+    if boss["active"]:
+        bw = 220
+        bx0 = W//2 - bw//2
+        glColor3f(0.15, 0.02, 0.15)
+        glBegin(GL_QUADS)
+        glVertex2f(bx0, H - 36)
+        glVertex2f(bx0 + bw, H - 36)
+        glVertex2f(bx0 + bw, H - 12)
+        glVertex2f(bx0, H - 12)
+        glEnd()
+        frac = boss["hp"] / BOSS_MAX_HP
+        glColor3f(0.85, 0.10, 0.85)
+        glBegin(GL_QUADS)
+        glVertex2f(bx0, H - 36)
+        glVertex2f(bx0 + bw*frac, H - 36)
+        glVertex2f(bx0 + bw*frac, H - 12)
+        glVertex2f(bx0, H - 12)
+        glEnd()
+        draw_bmp_str(W//2 - 28, H - 50, "BOSS DRONE", (1.0, 0.4, 1.0))
+
+    # ── Controls hint ─────────────────────────
+    draw_bmp_str(12, 12,
+        "WASD:move  SPC:jump  E:grapple  Q:release  F:fire  J/L:rotate",
+        (0.55, 0.55, 0.55))
+
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_LIGHTING)
+
+
+def draw_bmp_str(x, y, text, color=(1,1,1)):
+    glColor3f(*color)
+    glRasterPos2f(x, y)
+    for ch in text:
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, ord(ch))
+
+
+def draw_overlay_text(msg, color=(1,1,1)):
+    """Big centred overlay."""
+    glDisable(GL_LIGHTING)
+    glDisable(GL_DEPTH_TEST)
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    gluOrtho2D(0, W, 0, H)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+
+    # dim background
+    glColor4f(0, 0, 0, 0.55)
+    glBegin(GL_QUADS)
+    glVertex2f(0, 0); glVertex2f(W, 0)
+    glVertex2f(W, H); glVertex2f(0, H)
+    glEnd()
+
+    # text lines
+    lines = msg.split('\n')
+    for i, line in enumerate(lines):
+        lw = len(line) * 9
+        draw_bmp_str_18(W//2 - lw//2, H//2 + (len(lines)//2 - i) * 26, line, color)
+
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_LIGHTING)
+
+
+def draw_bmp_str_18(x, y, text, color=(1,1,1)):
+    glColor3f(*color)
+    glRasterPos2f(x, y)
+    for ch in text:
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, ord(ch))
+
+
+# ─────────────────────────────────────────────
+# TILE DAMAGE
+# ─────────────────────────────────────────────
+def damage_tile_at(wx, wy, wz, dmg=1):
+    for ri, r in enumerate(rooftops):
+        half = r["size"] / 2.0
+        if abs(wx - r["x"]) < half and abs(wy - r["y"]) < half:
+            if abs(wz - r["z"]) < 25:
+                tw  = r["size"] / TILE_N
+                col = int((wx - (r["x"] - half)) / tw)
+                row = int((wy - (r["y"] - half)) / tw)
+                col = max(0, min(TILE_N-1, col))
+                row = max(0, min(TILE_N-1, row))
+                tiles[ri][row][col] = max(0, tiles[ri][row][col] - dmg)
+                return True
+    return False
+
+
+def tile_hp_at(wx, wy, wz):
+    """Return HP of tile under position, or -1 if not over any rooftop."""
+    for ri, r in enumerate(rooftops):
+        half = r["size"] / 2.0
+        if abs(wx - r["x"]) < half and abs(wy - r["y"]) < half:
+            if abs(wz - r["z"]) < 30:
+                tw  = r["size"] / TILE_N
+                col = int((wx - (r["x"] - half)) / tw)
+                row = int((wy - (r["y"] - half)) / tw)
+                col = max(0, min(TILE_N-1, col))
+                row = max(0, min(TILE_N-1, row))
+                return tiles[ri][row][col], r["z"]
+    return -1, 0
+
+
+# ─────────────────────────────────────────────
+# PHYSICS / LOGIC
+# ─────────────────────────────────────────────
+def update_player():
+    px, py, pz = player["pos"]
+    fx, fy = player["facing"][0], player["facing"][1]
+    rx, ry = -fy, fx                         # right vector
+
+    # horizontal input
+    mvx, mvy = 0.0, 0.0
+    if 119 in keys_held or 87 in keys_held:  # w/W
+        mvx += fx; mvy += fy
+    if 115 in keys_held or 83 in keys_held:  # s/S
+        mvx -= fx; mvy -= fy
+    if 97  in keys_held or 65 in keys_held:  # a/A
+        mvx -= rx; mvy -= ry
+    if 100 in keys_held or 68 in keys_held:  # d/D
+        mvx += rx; mvy += ry
+    mag = math.sqrt(mvx*mvx + mvy*mvy + 1e-9)
+    if mag > 0:
+        player["pos"][0] += mvx/mag * PLAYER_SPEED * dt
+        player["pos"][1] += mvy/mag * PLAYER_SPEED * dt
+
+    # vertical
+    if not player["on_ground"] or player["vel"][2] > 0:
+        player["vel"][2] -= GRAVITY
+        player["pos"][2] += player["vel"][2]
+
+    # landing check
+    hp_val, land_z = tile_hp_at(player["pos"][0], player["pos"][1], player["pos"][2])
+    if hp_val > 0 and player["vel"][2] <= 0:
+        player["on_ground"] = True
+        player["vel"][2]    = 0.0
+        player["pos"][2]    = land_z + 13.0
+    elif not hook["attached"]:
+        player["on_ground"] = False
+
+    # fall-through broken tile
+    if hp_val == 0:
+        player["on_ground"] = False
+
+    # death floor
+    if player["pos"][2] < -80:
+        die()
+
+    if player["iframes"] > 0:
+        player["iframes"] -= 1
+
+
+def update_hook():
+    if not hook["active"]:
+        return
+
+    if not hook["attached"]:
+        for i in range(3):   # sub-steps for accuracy
+            hook["pos"][0] += hook["dir"][0] * HOOK_SPEED / 3
+            hook["pos"][1] += hook["dir"][1] * HOOK_SPEED / 3
+            hook["pos"][2] += hook["dir"][2] * HOOK_SPEED / 3
+
+        # max range
+        ddx = hook["pos"][0] - player["pos"][0]
+        ddy = hook["pos"][1] - player["pos"][1]
+        ddz = hook["pos"][2] - player["pos"][2]
+        if math.sqrt(ddx*ddx+ddy*ddy+ddz*ddz) > HOOK_RANGE:
+            hook["active"] = False
+            return
+
+        # attach to rooftop?
+        for ri, r in enumerate(rooftops):
+            half = r["size"] / 2.0
+            if (abs(hook["pos"][0]-r["x"]) < half and
+                    abs(hook["pos"][1]-r["y"]) < half and
+                    abs(hook["pos"][2]-r["z"]) < 30):
+                hook["attached"] = True
+                hook["target"]   = [r["x"], r["y"], float(r["z"])]
+                return
+
+        # attach to anchor?
+        for a in anchor_pts:
+            dx = hook["pos"][0]-a["x"]
+            dy = hook["pos"][1]-a["y"]
+            dz = hook["pos"][2]-a["z"]
+            if math.sqrt(dx*dx+dy*dy+dz*dz) < 28:
+                hook["attached"] = True
+                hook["target"]   = [a["x"], a["y"], a["z"]]
+                return
+
+    else:
+        # pull player toward anchor
+        tx, ty, tz = hook["target"]
+        dx = tx - player["pos"][0]
+        dy = ty - player["pos"][1]
+        dz = tz - player["pos"][2]
+        dist = math.sqrt(dx*dx+dy*dy+dz*dz)
+        if dist > 8:
+            pull = min(9.0, dist * 0.14)
+            player["pos"][0] += dx/dist * pull
+            player["pos"][1] += dy/dist * pull
+            player["pos"][2] += dz/dist * pull
+            player["vel"][2]  = 0.0
+            player["on_ground"] = False
+        else:
+            hook["active"] = hook["attached"] = False
+
+
+def update_projectiles():
+    global projectiles
+    alive = []
+    for p in projectiles:
+        p["x"] += (p["dx"] + wind[0]) * dt * 60
+        p["y"] += (p["dy"] + wind[1]) * dt * 60
+        p["z"] +=  p["dz"]            * dt * 60
+        p["life"] -= 1
+        if p["life"] <= 0:
+            continue
+
+        hit = False
+
+        # hit player
+        if p.get("enemy"):
+            if player["iframes"] == 0:
+                dx = p["x"]-player["pos"][0]
+                dy = p["y"]-player["pos"][1]
+                dz = p["z"]-player["pos"][2]
+                if math.sqrt(dx*dx+dy*dy+dz*dz) < 18:
+                    dmg = 2 if p.get("oneshot") else 1
+                    player["hp"] -= dmg
+                    player["iframes"] = 40
+                    if player["hp"] <= 0:
+                        die()
+                    hit = True
+
+        # hit tile
+        if not hit:
+            if damage_tile_at(p["x"], p["y"], p["z"]):
+                hit = True
+
+        # hit enemy (player bullets)
+        if not hit and not p.get("enemy"):
+            for e in enemies:
+                if not e["alive"]:
+                    continue
+                dx = p["x"]-e["pos"][0]
+                dy = p["y"]-e["pos"][1]
+                dz = p["z"]-e["pos"][2]
+                if math.sqrt(dx*dx+dy*dy+dz*dz) < 18:
+                    e["hp"] -= 1
+                    if e["hp"] <= 0:
+                        e["alive"] = False
+                        global kills
+                        kills += 1
+                    hit = True
+                    break
+
+        # hit boss
+        if not hit and not p.get("enemy") and boss["active"]:
+            dx = p["x"]-boss["pos"][0]
+            dy = p["y"]-boss["pos"][1]
+            dz = p["z"]-boss["pos"][2]
+            if math.sqrt(dx*dx+dy*dy+dz*dz) < 55:
+                boss["hp"] -= 1
+                hit = True
+                if boss["hp"] <= 0:
+                    boss["active"] = False
+                    global game_state
+                    game_state = "win"
+
+        if not hit:
+            alive.append(p)
+
+    projectiles = alive
+
+
+def update_enemies():
+    for e in enemies:
+        if not e["alive"]:
+            continue
+        e["shoot_timer"] -= 1
+        if e["shoot_timer"] <= 0:
+            dx = player["pos"][0]-e["pos"][0]
+            dy = player["pos"][1]-e["pos"][1]
+            dz = player["pos"][2]-e["pos"][2]
+            dist = math.sqrt(dx*dx+dy*dy+dz*dz + 1e-9)
+            projectiles.append({
+                "x": e["pos"][0], "y": e["pos"][1], "z": e["pos"][2],
+                "dx": dx/dist*3.5, "dy": dy/dist*3.5, "dz": dz/dist*3.5,
+                "life": 130, "enemy": True,
+            })
+            e["shoot_timer"] = random.randint(85, 145)
+
+
+def update_boss():
+    if not boss["active"]:
+        return
+
+    boss["propeller_angle"] = (boss["propeller_angle"] + 16) % 360
+
+    if boss["state"] == "idle":
+        boss["move_timer"] -= 1
+        if boss["move_timer"] <= 0:
+            boss["state"]        = "locking"
+            boss["lock_timer"]   = 120
+            boss["laser_active"] = True
+
+    elif boss["state"] == "locking":
+        boss["lock_timer"] -= 1
+        if boss["lock_timer"] <= 0:
+            # FIRE one-shot sniper round
+            dx = player["pos"][0]-boss["pos"][0]
+            dy = player["pos"][1]-boss["pos"][1]
+            dz = player["pos"][2]-boss["pos"][2]
+            dist = math.sqrt(dx*dx+dy*dy+dz*dz + 1e-9)
+            projectiles.append({
+                "x": boss["pos"][0], "y": boss["pos"][1], "z": boss["pos"][2]-9,
+                "dx": dx/dist*9, "dy": dy/dist*9, "dz": dz/dist*9,
+                "life": 250, "enemy": True, "oneshot": True,
+            })
+            boss["laser_active"] = False
+            boss["state"]        = "moving"
+            boss["target_pos"]   = [
+                random.uniform(-320, 320),
+                random.uniform(-320, 320),
+                random.uniform(430,  560),
+            ]
+
+    elif boss["state"] == "moving":
+        tx, ty, tz = boss["target_pos"]
+        dx = tx-boss["pos"][0]; dy = ty-boss["pos"][1]; dz = tz-boss["pos"][2]
+        dist = math.sqrt(dx*dx+dy*dy+dz*dz + 1e-9)
+        if dist > 6:
+            boss["pos"][0] += dx/dist * 4.5
+            boss["pos"][1] += dy/dist * 4.5
+            boss["pos"][2] += dz/dist * 4.5
+        else:
+            boss["state"]      = "idle"
+            boss["move_timer"] = 85
+
+
+def check_wave_end():
+    global wave, game_state
+    alive = sum(1 for e in enemies if e["alive"])
+    if alive == 0 and not boss["active"]:
+        if wave >= 3:
+            boss["active"] = True
+            boss["hp"]     = BOSS_MAX_HP
+            boss["pos"]    = [0.0, 0.0, 520.0]
+            boss["state"]  = "idle"
+            boss["move_timer"] = 80
+            boss["laser_active"] = False
+        else:
+            wave += 1
+            wind[0] = random.uniform(-0.30, 0.30)
+            wind[1] = random.uniform(-0.18, 0.18)
+            spawn_enemies(wave)
+
+
+def die():
+    global game_state
+    game_state = "dead"
+
+
+def fire_player():
+    fx, fy, fz = player["facing"]
+    projectiles.append({
+        "x":  player["pos"][0] + fx * 14,
+        "y":  player["pos"][1] + fy * 14,
+        "z":  player["pos"][2] + 4,
+        "dx": fx * 7.0,
+        "dy": fy * 7.0,
+        "dz": fz * 7.0 + 0.05,
+        "life": 110, "enemy": False,
+    })
+
+
+def update_all():
+    if game_state != "playing":
+        return
+    update_player()
+    update_hook()
+    update_projectiles()
+    update_enemies()
+    update_boss()
+    check_wave_end()
+
+
+# ─────────────────────────────────────────────
+# INPUT
+# ─────────────────────────────────────────────
+def keyboard_down(key, x, y):
+    code = key[0] if isinstance(key, bytes) else ord(key)
+    keys_held.add(code)
+    ch = chr(code).lower()
+
+    if ch == ' ':
+        if player["on_ground"]:
+            player["vel"][2]    = JUMP_VEL
+            player["on_ground"] = False
+
+    elif ch == 'e':
+        hook["active"]   = True
+        hook["attached"] = False
+        hook["pos"]      = player["pos"][:]
+        fx, fy = player["facing"][0], player["facing"][1]
+        raw = [fx, fy, 0.25]
+        m   = math.sqrt(sum(v*v for v in raw))
+        hook["dir"] = [v/m for v in raw]
+
+    elif ch == 'q':
+        hook["active"] = hook["attached"] = False
+
+    elif ch == 'f':
+        fire_player()
+
+    elif ch == 'l':
+        player["angle"] -= 12
+        a = math.radians(player["angle"])
+        player["facing"] = [math.cos(a), math.sin(a), 0.0]
+
+    elif ch == 'j':
+        player["angle"] += 12
+        a = math.radians(player["angle"])
+        player["facing"] = [math.cos(a), math.sin(a), 0.0]
+
+    elif ch == 'r' and game_state in ("dead", "win"):
+        restart()
+
+
+def keyboard_up(key, x, y):
+    code = key[0] if isinstance(key, bytes) else ord(key)
+    keys_held.discard(code)
+
+
+def restart():
+    global game_state, wave, kills, projectiles
+    game_state = "playing"
+    wave = 1; kills = 0
+    projectiles = []
+    hook["active"] = hook["attached"] = False
+
+    boss.update({"active": False, "hp": BOSS_MAX_HP, "laser_active": False,
+                 "state": "idle", "move_timer": 90, "propeller_angle": 0.0})
+
+    player.update({"hp": 5, "vel": [0.0, 0.0, 0.0],
+                   "on_ground": True, "iframes": 0, "angle": 0.0,
+                   "facing": [1.0, 0.0, 0.0]})
+    s = rooftops[12]
+    player["pos"] = [s["x"], s["y"], s["z"] + 15.0]
+
+    for ri in range(len(rooftops)):
+        tiles[ri] = [[TILE_HP_MAX]*TILE_N for _ in range(TILE_N)]
+
+    wind[:] = [0.18, 0.06]
+    spawn_enemies(wave)
+
+
+# ─────────────────────────────────────────────
+# MAIN DISPLAY / LOOP
+# ─────────────────────────────────────────────
+def display():
+    global last_t, dt
+    now = time.time()
+    dt  = min(now - last_t, 0.05)
+    last_t = now
+
+    update_all()
+
+    glClearColor(0.04, 0.04, 0.12, 1.0)
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    glLoadIdentity()
+
+    # camera: behind and above player
+    px, py, pz = player["pos"]
+    fx, fy     = player["facing"][0], player["facing"][1]
+    cx = px - fx*280
+    cy = py - fy*280
+    cz = pz + 190
+    gluLookAt(cx, cy, cz, px, py, pz, 0, 0, 1)
+
+    # infinite-looking dark ground
+    glDisable(GL_LIGHTING)
+    glColor3f(0.04, 0.04, 0.08)
+    glBegin(GL_QUADS)
+    glVertex3f(-2000, -2000, -15)
+    glVertex3f( 2000, -2000, -15)
+    glVertex3f( 2000,  2000, -15)
+    glVertex3f(-2000,  2000, -15)
+    glEnd()
+
+    # faint grid on ground
+    glColor3f(0.08, 0.08, 0.14)
+    glBegin(GL_LINES)
+    for i in range(-10, 11):
+        glVertex3f(i*200, -2000, -14); glVertex3f(i*200,  2000, -14)
+        glVertex3f(-2000, i*200, -14); glVertex3f( 2000,  i*200, -14)
+    glEnd()
+    glEnable(GL_LIGHTING)
+
+    draw_rooftops_scene()
+    draw_anchors()
+    draw_player()
+    draw_enemies()
+    draw_hook()
+    draw_projectiles()
+    draw_boss()
+    draw_hud()
+
+    if game_state == "dead":
+        draw_overlay_text("YOU DIED\nPress R to restart", (1.0, 0.25, 0.25))
+    elif game_state == "win":
+        draw_overlay_text(f"VICTORY!\nWaves cleared: {wave}   Kills: {kills}\nPress R to play again",
+                          (0.25, 1.0, 0.35))
+
+    glutSwapBuffers()
+
+
+def idle():
+    glutPostRedisplay()
+
+
+def reshape(w, h):
+    global W, H
+    W, H = max(w, 1), max(h, 1)
+    glViewport(0, 0, W, H)
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(58.0, W/H, 2.0, 4000.0)
+    glMatrixMode(GL_MODELVIEW)
+
+
+# ─────────────────────────────────────────────
+# GL INIT
+# ─────────────────────────────────────────────
+def init_gl():
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glShadeModel(GL_SMOOTH)
+
+    glEnable(GL_LIGHTING)
+    glEnable(GL_LIGHT0)
+    glLightfv(GL_LIGHT0, GL_POSITION, [300.0, 300.0, 800.0, 1.0])
+    glLightfv(GL_LIGHT0, GL_DIFFUSE,  [1.0, 0.95, 0.90, 1.0])
+    glLightfv(GL_LIGHT0, GL_AMBIENT,  [0.28, 0.28, 0.38, 1.0])
+    glLightfv(GL_LIGHT0, GL_SPECULAR, [0.5, 0.5, 0.5, 1.0])
+
+    glEnable(GL_COLOR_MATERIAL)
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+
+    init_world()
+
+
+# ─────────────────────────────────────────────
+# ENTRY
+# ─────────────────────────────────────────────
+glutInit()
+glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH)
+glutInitWindowSize(W, H)
+glutCreateWindow(b"ROOFTOP RECKONING")
+
+init_gl()
+
+glutDisplayFunc(display)
+glutIdleFunc(idle)
+glutKeyboardFunc(keyboard_down)
+glutKeyboardUpFunc(keyboard_up)
+glutReshapeFunc(reshape)
+
+print("""
+╔══════════════════════════════════════════╗
+║         ROOFTOP  RECKONING               ║
+╠══════════════════════════════════════════╣
+║  WASD       - Move                       ║
+║  SPACE      - Jump                       ║
+║  E          - Fire grappling hook        ║
+║  Q          - Release hook               ║
+║  F          - Shoot bullet               ║
+║  J / L      - Rotate left / right        ║
+║  R          - Restart (on death/win)     ║
+╠══════════════════════════════════════════╣
+║  • Survive 3 waves then fight the boss   ║
+║  • Shoot floor tiles to drop enemies     ║
+║  • Chain grapples via glowing anchors    ║
+║  • Wind drifts all bullets – aim upwind  ║
+║  • Move during boss laser lock-on!       ║
+╚══════════════════════════════════════════╝
+""")
+
+glutMainLoop()
